@@ -17,6 +17,7 @@
 
 from __future__ import unicode_literals
 import argparse
+import hashlib
 import locale
 import logging
 import os
@@ -25,7 +26,7 @@ import stat
 import subprocess
 import time
 from types import TracebackType
-from typing import Callable, cast, Dict, List, IO, Iterable, Optional, Tuple, Type
+from typing import Callable, cast, Dict, List, IO, Iterable, Optional, Set, Tuple, Type
 
 
 class OSLike(object):
@@ -51,10 +52,6 @@ class OSLike(object):
   def utime(self, path: bytes, times: Tuple[float, float]) -> None:  # os's name, so pylint: disable=g-bad-name
     raise NotImplementedError('Abstract')
 
-  def md5sum(self, path: bytes) -> bytes:
-    raise NotImplementedError('Abstract')
-
-
 class GlobLike(object):
 
   def glob(self, path: bytes) -> Iterable[bytes]:  # glob's name, so pylint: disable=g-bad-name
@@ -78,16 +75,19 @@ class Stdout(object):
     """
     self.popen = subprocess.Popen(args, stdout=subprocess.PIPE)
 
-  def __enter__(self) -> IO:
+  def __enter__(self) -> IO[bytes]:
+    if self.popen.stdout is None:
+      raise OSError('Subprocess stdout was not captured.')
     return self.popen.stdout
 
   def __exit__(self, exc_type: Optional[Type[BaseException]],
                exc_val: Optional[Exception],
-               exc_tb: Optional[TracebackType]) -> bool:
+               exc_tb: Optional[TracebackType]) -> None:
+    if self.popen.stdout is None:
+      raise OSError('Subprocess stdout was not captured.')
     self.popen.stdout.close()
     if self.popen.wait() != 0:
       raise OSError('Subprocess exited with nonzero status.')
-    return False
 
 
 class AdbFileSystem(GlobLike, OSLike):
@@ -95,7 +95,6 @@ class AdbFileSystem(GlobLike, OSLike):
 
   def __init__(self, adb: List[bytes]) -> None:
     self.stat_cache = {}  # type: Dict[bytes, os.stat_result]
-    self.md5_cache = {}
     self.adb = adb
 
   # Regarding parsing stat results, we only care for the following fields:
@@ -296,30 +295,53 @@ class AdbFileSystem(GlobLike, OSLike):
         [b'shell', b'rmdir %s' % (self.QuoteArgument(path),)]) != 0:
       raise OSError('rmdir failed')
 
-  def md5sum(self, path: bytes) -> bytes:  # pylint: disable=g-bad-name
-        """Calculate md5 hash"""
-        # check cache
-        if path in self.md5_cache:
-            return self.md5_cache[path]
+  def Checksums(self, paths: List[bytes]) -> Dict[bytes, bytes]:
+    """Calculate checksums on the device, batching paths per adb invocation."""
+    checksums = {}  # type: Dict[bytes, bytes]
+    batches = []  # type: List[List[bytes]]
+    batch = []  # type: List[bytes]
+    command_size = 0
+    for path in paths:
+      quoted_path = self.QuoteArgument(path)
+      # Keep below typical shell command length limits and avoid an adb round
+      # trip for every file.
+      if batch and (len(batch) >= 128 or
+                    command_size + len(quoted_path) + 1 > 24576):
+        batches.append(batch)
+        batch = []
+        command_size = 0
+      batch.append(path)
+      command_size += len(quoted_path) + 1
+    if batch:
+      batches.append(batch)
 
-        # query md5sum
-        md5_output = b''
-        try:
-            with Stdout(self.adb +
-                         [b'shell',
-                          b'md5sum -b %s' % self.QuoteArgument(path)]) as stdout:
-                md5_output = stdout.read().split()[0]
-        except Exception as e:
-            logging.error('md5sum failed for %s: %s', path.decode(), e)
-            raise OSError('md5sum command failed') from e
-
-        # verify md5sum
-        if len(md5_output) != 32:  # MD5 hash should be 32byte
-            logging.error('Invalid md5sum output: %s', md5_output)
-            raise OSError('Invalid md5sum output')
-
-        self.md5_cache[path] = md5_output
-        return md5_output
+    for batch in batches:
+      command = (
+          b'for p in ' +
+          b' '.join(self.QuoteArgument(path) for path in batch) +
+          b'; do checksum=$(md5sum < "$p") || exit $?; '
+          b'echo "${checksum%% *}"; done')
+      try:
+        with Stdout(self.adb + [b'shell', command]) as stdout:
+          output = stdout.read()
+      except OSError as error:
+        raise OSError(
+            'Could not calculate checksums on the device. '
+            'Ensure that md5sum is installed and the files are readable.'
+        ) from error
+      lines = output.splitlines()
+      if len(lines) != len(batch):
+        raise OSError(
+            'Unexpected md5sum output from the device: expected %d lines, '
+            'got %d.' % (len(batch), len(lines)))
+      for path, line in zip(batch, lines):
+        fields = line.split()
+        checksum = fields[0].lower() if fields else b''
+        if not re.fullmatch(br'[0-9a-f]{32}', checksum):
+          raise OSError('Invalid checksum returned for %r: %r' %
+                        (path, line))
+        checksums[path] = checksum
+    return checksums
 
   def makedirs(self, path: bytes) -> None:  # os's name, so pylint: disable=g-bad-name
     """Create a directory."""
@@ -365,8 +387,20 @@ class AdbFileSystem(GlobLike, OSLike):
       raise OSError('pull failed')
 
 
+def FileChecksum(path: bytes) -> bytes:
+  """Calculate a local file checksum without invoking a shell."""
+  digest = hashlib.md5()  # nosec: Used for change detection, not security.
+  with open(path, 'rb') as input_file:
+    while True:
+      data = input_file.read(1024 * 1024)
+      if not data:
+        break
+      digest.update(data)
+  return digest.hexdigest().encode('ascii')
+
+
 def BuildFileList(fs: OSLike, path: bytes, follow_links: bool,
-                  prefix: bytes, checksum: bool) -> Iterable[Tuple[bytes, os.stat_result]]:
+                  prefix: bytes) -> Iterable[Tuple[bytes, os.stat_result]]:
   """Builds a file list.
 
   Args:
@@ -380,16 +414,6 @@ def BuildFileList(fs: OSLike, path: bytes, follow_links: bool,
     File names from path (prefixed by prefix).
     Directories are yielded before their contents.
   """
-  def get_md5sum():
-    if not checksum:
-      return "empty"
-    if isinstance(fs, AdbFileSystem):
-      md5sum = fs.md5sum(path)
-    else:
-      stdout = subprocess.check_output(f"md5sum {path.decode()}", shell=True)
-      md5sum = stdout.split()[0]
-      # print(f"md5sum {md5sum}")
-    return md5sum
   try:
     if follow_links:
       statresult = fs.stat(path)
@@ -398,7 +422,7 @@ def BuildFileList(fs: OSLike, path: bytes, follow_links: bool,
   except OSError:
     return
   if stat.S_ISDIR(statresult.st_mode):
-    yield prefix, statresult, "dir"
+    yield prefix, statresult
     try:
       files = fs.listdir(path)
     except OSError:
@@ -407,19 +431,18 @@ def BuildFileList(fs: OSLike, path: bytes, follow_links: bool,
       if n == b'.' or n == b'..':
         continue
       for t in BuildFileList(fs, path + b'/' + n, follow_links,
-                             prefix + b'/' + n, checksum):
+                             prefix + b'/' + n):
         yield t
   elif stat.S_ISREG(statresult.st_mode):
-    yield prefix, statresult, get_md5sum()
+    yield prefix, statresult
   elif stat.S_ISLNK(statresult.st_mode) and not follow_links:
-    yield prefix, statresult, get_md5sum()
+    yield prefix, statresult
   else:
     logging.info('Unsupported file: %r.', path)
 
 
 def DiffLists(a: Iterable[Tuple[bytes, os.stat_result]],
-              b: Iterable[Tuple[bytes, os.stat_result]],
-              checksum: bool
+              b: Iterable[Tuple[bytes, os.stat_result]]
              ) -> Tuple[List[Tuple[bytes, os.stat_result]], List[
                  Tuple[bytes, os.stat_result, os
                        .stat_result]], List[Tuple[bytes, os.stat_result]]]:
@@ -452,20 +475,16 @@ def DiffLists(a: Iterable[Tuple[bytes, os.stat_result]],
       break
     a_item = a_revlist[len(a_revlist) - 1]
     b_item = b_revlist[len(b_revlist) - 1]
-    if a_item[0] == b_item[0] and ((not checksum) or (checksum and a_item[2] == b_item[2])):
-      # print(f"a_item[2]: {a_item[2]}, b_item[2]: {b_item[2]}, {a_item[2] == b_item[2]}")
+    if a_item[0] == b_item[0]:
       both.append((a_item[0], a_item[1], b_item[1]))
       a_revlist.pop()
       b_revlist.pop()
-    elif (a_item[0] < b_item[0]):
+    elif a_item[0] < b_item[0]:
       a_only.append(a_item)
       a_revlist.pop()
     elif a_item[0] > b_item[0]:
       b_only.append(b_item)
       b_revlist.pop()
-    elif checksum and (a_item[2] != b_item[2]):
-      a_only.append(a_item)
-      a_revlist.pop()
     else:
       raise
 
@@ -501,13 +520,12 @@ class DeleteInterruptedFile(object):
 
   def __exit__(self, exc_type: Optional[Type[BaseException]],
                exc_val: Optional[Exception],
-               exc_tb: Optional[TracebackType]) -> bool:
+               exc_tb: Optional[TracebackType]) -> None:
     if exc_type is not None:
       logging.info('Interrupted-%s-Delete: %r',
                    'Pull' if self.fs == os else 'Push', self.name)
       if not self.dry_run:
         self.fs.unlink(self.name)
-    return False
 
 
 class FileSyncer(object):
@@ -517,7 +535,7 @@ class FileSyncer(object):
                local_to_remote: bool, remote_to_local: bool,
                preserve_times: bool, delete_missing: bool,
                allow_overwrite: bool, allow_replace: bool, copy_links: bool,
-               dry_run: bool, checksum: bool) -> None:
+               dry_run: bool, checksum: bool = False) -> None:
     self.local = local_path
     self.remote = remote_path
     self.adb = adb
@@ -530,6 +548,7 @@ class FileSyncer(object):
     self.copy_links = copy_links
     self.dry_run = dry_run
     self.checksum = checksum
+    self.checksum_different = set()  # type: Set[bytes]
     self.num_bytes = 0
     self.start_time = time.time()
 
@@ -555,11 +574,25 @@ class FileSyncer(object):
     """Scans the local and remote locations and identifies differences."""
     logging.info('Scanning and diffing...')
     locallist = BuildFileList(
-        cast(OSLike, os), self.local, self.copy_links, b'', self.checksum)
-    remotelist = BuildFileList(self.adb, self.remote, self.copy_links, b'', self.checksum)
+        cast(OSLike, os), self.local, self.copy_links, b'')
+    remotelist = BuildFileList(
+        self.adb, self.remote, self.copy_links, b'')
 
     self.local_only, self.both, self.remote_only = DiffLists(
-        locallist, remotelist, self.checksum)
+        locallist, remotelist)
+    if self.checksum:
+      candidates = [
+          name for name, localstat, remotestat in self.both
+          if stat.S_ISREG(localstat.st_mode)
+          and stat.S_ISREG(remotestat.st_mode)
+          and localstat.st_size == remotestat.st_size
+      ]
+      remote_paths = [self.remote + name for name in candidates]
+      remote_checksums = self.adb.Checksums(remote_paths)
+      for name, remote_path in zip(candidates, remote_paths):
+        local_checksum = FileChecksum(self.local + name)
+        if local_checksum != remote_checksums[remote_path]:
+          self.checksum_different.add(name)
     if not self.local_only and not self.both and not self.remote_only:
       logging.warning('No files seen. User error?')
     self.src_to_dst = (self.local_to_remote, self.remote_to_local)
@@ -606,7 +639,8 @@ class FileSyncer(object):
         pass
       else:
         # File vs file? Compare sizes.
-        if localstat.st_size == remotestat.st_size:
+        if (localstat.st_size == remotestat.st_size and
+            name not in self.checksum_different):
           continue
       l2r = self.local_to_remote
       r2l = self.remote_to_local
@@ -663,7 +697,7 @@ class FileSyncer(object):
       else:
         if not self.dry_run:
           self.dst_fs[i].unlink(dst_name)
-      src_only_prepend[i].append((name, src_stat, "empty"))
+      src_only_prepend[i].append((name, src_stat))
     for i in [0, 1]:
       self.src_only[i][:0] = src_only_prepend[i]
 
@@ -671,8 +705,7 @@ class FileSyncer(object):
     """Perform all copying necessary for the file sync operation."""
     for i in [0, 1]:
       if self.src_to_dst[i]:
-        print(f"self.src_only[{i}]: {self.src_only[i]}")
-        for name, s, _ in self.src_only[i]:
+        for name, s in self.src_only[i]:
           src_name = self.src[i] + name
           dst_name = self.dst[i] + name
           logging.info('%s: %r', self.push[i], dst_name)
@@ -844,9 +877,12 @@ def main() -> None:
       action='store_true',
       help='Do not do anything - just show what would be done.')
   parser.add_argument(
+      '-c',
       '--checksum',
       action='store_true',
-      help='Use md5sum to get the file diff and sync.')
+      help='Compare file contents instead of relying only on file size. '
+      'This is more accurate, but requires reading same-size files on '
+      'both sides.')
   args = parser.parse_args()
 
   localpatterns = [os.fsencode(x) for x in args.source]
@@ -918,7 +954,8 @@ def main() -> None:
     logging.info('Sync: local %r, remote %r', localpaths[i], remotepaths[i])
     syncer = FileSyncer(adb, localpaths[i], remotepaths[i], local_to_remote,
                         remote_to_local, preserve_times, delete_missing,
-                        allow_overwrite, allow_replace, copy_links, dry_run, checksum)
+                        allow_overwrite, allow_replace, copy_links, dry_run,
+                        checksum)
     if not syncer.IsWorking():
       logging.error('Device not connected or not working.')
       return
