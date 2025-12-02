@@ -99,6 +99,21 @@ To copy all downloads from your device to your PC, type:
 adb-sync --reverse /sdcard/Download/ ~/Downloads
 ```
 
+Accurate File Comparison
+========================
+
+By default, adb-sync treats files with the same path and size as unchanged.
+Use `--checksum` (or `-c`) to compare the contents of same-size files:
+
+```
+adb-sync --checksum ~/Music/ /sdcard/Music
+```
+
+This avoids skipping files whose contents changed without changing their
+size. It requires reading those same-size files on both the PC and the device,
+so scanning can take longer. Only files whose contents differ are transferred.
+The device must provide an `md5sum` command.
+
 ADB Channel
 ===========
 
