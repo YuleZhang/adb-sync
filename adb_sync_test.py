@@ -17,8 +17,10 @@
 
 import importlib.machinery
 import importlib.util
+import hashlib
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -208,22 +210,198 @@ class ChecksumTest(unittest.TestCase):
         {entry[0] for entry in syncer.both})
 
   def test_remote_checksum_output_does_not_parse_file_names(self):
-    stdout = mock.Mock()
-    stdout.read.return_value = b'a' * 32 + b'\n' + b'b' * 32 + b'\n'
-    context = mock.MagicMock()
-    context.__enter__.return_value = stdout
+    output = b'a' * 32 + b'\n' + b'b' * 32 + b'\n'
     adb = adb_sync.AdbFileSystem([b'adb'])
-    with mock.patch.object(adb_sync, 'Stdout', return_value=context) as popen:
+    with mock.patch.object(
+        adb, '_RunAdb', return_value=(0, output)) as run_adb:
       checksums = adb.Checksums(
           [b'/remote/with space', b'/remote/semi;echo injected'])
     self.assertEqual({
         b'/remote/with space': b'a' * 32,
         b'/remote/semi;echo injected': b'b' * 32,
     }, checksums)
-    command = popen.call_args[0][0][-1]
+    command = run_adb.call_args[0][0][-1]
     self.assertIn(b'"/remote/with space"', command)
     self.assertIn(b'"/remote/semi;echo injected"', command)
     self.assertIn(b'md5sum < "$p"', command)
+
+
+class ReconnectTest(unittest.TestCase):
+  """Transient tcp/remote drops should reconnect and retry, not crash."""
+
+  def _Completed(self, returncode, stdout=b'', stderr=b''):
+    return subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+  def test_transient_drop_triggers_reconnect_and_retry(self):
+    adb = adb_sync.AdbFileSystem([b'adb', b'-s', b'10.0.0.1:5555'])
+    attempts = [
+        self._Completed(1, b'', b"adb: device '10.0.0.1:5555' not found"),
+        self._Completed(0, b'output\n', b''),
+    ]
+    with mock.patch.object(
+        adb_sync.subprocess, 'run', side_effect=attempts) as run, \
+        mock.patch.object(adb, '_Reconnect', return_value=True) as reconnect, \
+        mock.patch.object(adb_sync.time, 'sleep'):
+      returncode, output = adb._RunAdb([b'shell', b'true'], capture_stdout=True)
+    self.assertEqual(0, returncode)
+    self.assertEqual(b'output\n', output)
+    self.assertEqual(2, run.call_count)
+    reconnect.assert_called_once()
+
+  def test_eof_push_error_is_treated_as_transient(self):
+    adb = adb_sync.AdbFileSystem([b'adb', b'-s', b'10.0.0.1:5555'])
+    attempts = [
+        self._Completed(1, b'', b'adb: error: failed to read copy response: EOF'),
+        self._Completed(0, b'', b''),
+    ]
+    with mock.patch.object(
+        adb_sync.subprocess, 'run', side_effect=attempts) as run, \
+        mock.patch.object(adb, '_Reconnect', return_value=True), \
+        mock.patch.object(adb_sync.time, 'sleep'):
+      returncode, _ = adb._RunAdb([b'push', b'a', b'/b'], capture_stdout=False)
+    self.assertEqual(0, returncode)
+    self.assertEqual(2, run.call_count)
+
+  def test_non_transport_failure_is_not_retried(self):
+    adb = adb_sync.AdbFileSystem([b'adb', b'-s', b'10.0.0.1:5555'])
+    with mock.patch.object(
+        adb_sync.subprocess, 'run',
+        return_value=self._Completed(
+            1, b'', b'ls: /x: No such file or directory')) as run, \
+        mock.patch.object(adb, '_Reconnect') as reconnect:
+      returncode, _ = adb._RunAdb([b'shell', b'ls /x'], capture_stdout=True)
+    self.assertEqual(1, returncode)
+    self.assertEqual(1, run.call_count)
+    reconnect.assert_not_called()
+
+  def test_reconnect_targets_tcp_serial_without_dash_s(self):
+    adb = adb_sync.AdbFileSystem([b'adb', b'-s', b'10.0.0.1:5555'])
+    with mock.patch.object(
+        adb_sync.subprocess, 'run',
+        return_value=self._Completed(0, b'connected to 10.0.0.1:5555')) as run:
+      self.assertTrue(adb._Reconnect())
+    self.assertEqual([b'adb', b'connect', b'10.0.0.1:5555'], run.call_args[0][0])
+
+  def test_reconnect_uses_android_serial_env(self):
+    adb = adb_sync.AdbFileSystem([b'adb'])
+    with mock.patch.object(
+        adb_sync.subprocess, 'run',
+        return_value=self._Completed(0, b'connected to 10.0.0.2:5555')) as run, \
+        mock.patch.dict(
+            adb_sync.os.environb, {b'ANDROID_SERIAL': b'10.0.0.2:5555'}):
+      self.assertTrue(adb._Reconnect())
+    self.assertEqual([b'adb', b'connect', b'10.0.0.2:5555'], run.call_args[0][0])
+
+  def test_no_reconnect_without_tcp_serial(self):
+    adb = adb_sync.AdbFileSystem([b'adb'])
+    with mock.patch.object(adb_sync.subprocess, 'run') as run, \
+        mock.patch.dict(adb_sync.os.environb, {}, clear=True):
+      self.assertFalse(adb._Reconnect())
+    run.assert_not_called()
+
+  def test_is_working_returns_false_when_device_gone(self):
+    adb = adb_sync.AdbFileSystem([b'adb', b'-s', b'10.0.0.1:5555'])
+    with mock.patch.object(
+        adb_sync.subprocess, 'run',
+        return_value=self._Completed(
+            1, b'', b"adb: device '10.0.0.1:5555' not found")), \
+        mock.patch.object(adb, '_Reconnect', return_value=True), \
+        mock.patch.object(adb_sync.time, 'sleep'):
+      # Must return False cleanly instead of raising an unhandled OSError.
+      self.assertFalse(adb.IsWorking())
+
+  def test_push_accepts_landed_file_after_dropped_response(self):
+    adb = adb_sync.AdbFileSystem([b'adb', b'-s', b'10.0.0.1:5555'])
+    with tempfile.TemporaryDirectory() as directory:
+      src = os.fsencode(os.path.join(directory, 'blob'))
+      with open(src, 'wb') as output:
+        output.write(b'x' * 4096)
+      dst = b'/data/local/tmp/blob'
+      with mock.patch.object(
+          adb_sync.subprocess, 'run',
+          return_value=self._Completed(
+              1, b'', b'adb: error: failed to read copy response: EOF')), \
+          mock.patch.object(adb, '_Reconnect', return_value=True), \
+          mock.patch.object(adb_sync.time, 'sleep'), \
+          mock.patch.object(adb, 'lstat', return_value=Stat(4096)):
+        adb.Push(src, dst)  # Must not raise: the file landed at the right size.
+
+  def test_push_still_fails_when_file_did_not_land(self):
+    adb = adb_sync.AdbFileSystem([b'adb', b'-s', b'10.0.0.1:5555'])
+    with tempfile.TemporaryDirectory() as directory:
+      src = os.fsencode(os.path.join(directory, 'blob'))
+      with open(src, 'wb') as output:
+        output.write(b'x' * 4096)
+      with mock.patch.object(
+          adb_sync.subprocess, 'run',
+          return_value=self._Completed(
+              1, b'', b'adb: error: failed to read copy response: EOF')), \
+          mock.patch.object(adb, '_Reconnect', return_value=True), \
+          mock.patch.object(adb_sync.time, 'sleep'), \
+          mock.patch.object(
+              adb, 'lstat', side_effect=OSError('No such file or directory')):
+        with self.assertRaises(OSError):
+          adb.Push(src, b'/data/local/tmp/blob')
+
+
+class ChunkedPushTest(unittest.TestCase):
+  """A file too big for the connection window is split, reassembled, verified."""
+
+  def _MakeSrc(self, directory, size):
+    src = os.fsencode(os.path.join(directory, 'big'))
+    with open(src, 'wb') as output:
+      output.write(os.urandom(size))
+    return src
+
+  def _RunChunked(self, adb, src, dst, corrupt=False):
+    store = {}
+    pushed_order = []
+
+    def fake_run_adb(args, capture_stdout):
+      # args == [b'push', local_part, remote_part]
+      local_part, remote_part = args[-2], args[-1]
+      with open(local_part, 'rb') as handle:
+        store[remote_part] = handle.read()
+      pushed_order.append(remote_part)
+      return 0, None
+
+    def fake_shell_call(command):
+      if command.startswith(b'cat '):
+        store[dst] = b''.join(store[name] for name in pushed_order)
+        if corrupt:
+          store[dst] = store[dst][:-1]
+      return 0
+
+    def fake_checksums(paths):
+      return {
+          path: hashlib.md5(store.get(path, b'')).hexdigest().encode('ascii')
+          for path in paths
+      }
+
+    with mock.patch.object(adb, '_RunAdb', side_effect=fake_run_adb), \
+        mock.patch.object(adb, '_RunAdbShellCall', side_effect=fake_shell_call), \
+        mock.patch.object(adb, 'Checksums', side_effect=fake_checksums):
+      adb._PushChunked(src, dst)
+    return store
+
+  def test_chunked_push_reassembles_and_verifies(self):
+    adb = adb_sync.AdbFileSystem([b'adb', b'-s', b'10.0.0.1:5555'])
+    with tempfile.TemporaryDirectory() as directory:
+      # Three whole chunks plus a partial one.
+      size = adb_sync.ADB_CHUNKED_PUSH_BYTES * 3 + 123
+      src = self._MakeSrc(directory, size)
+      store = self._RunChunked(adb, src, b'/data/local/tmp/big')
+      with open(src, 'rb') as handle:
+        self.assertEqual(handle.read(), store[b'/data/local/tmp/big'])
+
+  def test_chunked_push_rejects_corrupted_reassembly(self):
+    adb = adb_sync.AdbFileSystem([b'adb', b'-s', b'10.0.0.1:5555'])
+    with tempfile.TemporaryDirectory() as directory:
+      size = adb_sync.ADB_CHUNKED_PUSH_BYTES * 2
+      src = self._MakeSrc(directory, size)
+      with self.assertRaises(OSError):
+        self._RunChunked(adb, src, b'/data/local/tmp/big', corrupt=True)
 
 
 if __name__ == '__main__':
