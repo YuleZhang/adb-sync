@@ -24,6 +24,8 @@ import os
 import re
 import stat
 import subprocess
+import sys
+import tempfile
 import time
 from types import TracebackType
 from typing import Callable, cast, Dict, List, IO, Iterable, Optional, Set, Tuple, Type
@@ -90,12 +92,139 @@ class Stdout(object):
       raise OSError('Subprocess exited with nonzero status.')
 
 
+# Substrings adb prints to stderr when a tcp/remote device drops its
+# connection. These are transient: a fresh 'adb connect host:port' brings the
+# device back, so we reconnect and retry instead of aborting the whole sync.
+ADB_TRANSPORT_ERROR_MARKERS = (
+    b'error: closed',
+    b'device offline',
+    b'not found',
+    b'no devices/emulators found',
+    b'no devices found',
+    b'protocol fault',
+    b"couldn't read",
+    b'failed to read',
+    b'eof',
+    b'connection reset',
+    b'broken pipe',
+    b'failed to connect',
+    b'cannot connect',
+    b'device still authorizing',
+    b'device still connecting',
+)
+ADB_RECONNECT_MAX_RETRIES = 8
+ADB_RECONNECT_BACKOFF_SEC = 0.5
+# 'adb connect' is itself flaky on these devices ('connect failed: closed'),
+# so the reconnect retries the connect until the device confirms it is back.
+ADB_CONNECT_MAX_RETRIES = 4
+# When a normal push keeps failing on a tcp device whose connection window is
+# shorter than the transfer (a big file always straddles a drop), retry it in
+# chunks small enough to land between drops, then reassemble and checksum-verify
+# on the device so a truncated chunk can never masquerade as a good push.
+ADB_CHUNKED_PUSH_THRESHOLD = 8 * 1024 * 1024
+ADB_CHUNKED_PUSH_BYTES = 2 * 1024 * 1024
+ADB_CHUNK_SUFFIX = b'.adbsync-part'
+
+
 class AdbFileSystem(GlobLike, OSLike):
   """Mimics os's file interface but uses the adb utility."""
 
   def __init__(self, adb: List[bytes]) -> None:
     self.stat_cache = {}  # type: Dict[bytes, os.stat_result]
     self.adb = adb
+
+  def _AdbServerCommand(self) -> List[bytes]:
+    """self.adb with any '-s SERIAL' removed, for use with 'adb connect'."""
+    base = []  # type: List[bytes]
+    skip = False
+    for token in self.adb:
+      if skip:
+        skip = False
+        continue
+      if token == b'-s':
+        skip = True
+        continue
+      base.append(token)
+    return base
+
+  def _TcpSerial(self) -> Optional[bytes]:
+    """The 'host:port' serial adb targets, from '-s' or ANDROID_SERIAL."""
+    for index, token in enumerate(self.adb):
+      if token == b'-s' and index + 1 < len(self.adb):
+        serial = self.adb[index + 1]
+        return serial if b':' in serial else None
+    env_serial = os.environb.get(b'ANDROID_SERIAL', b'')
+    return env_serial if b':' in env_serial else None
+
+  def _Reconnect(self) -> bool:
+    """Restore a dropped tcp adb connection; returns whether it was attempted."""
+    serial = self._TcpSerial()
+    if not serial:
+      return False
+    connect_command = self._AdbServerCommand() + [b'connect', serial]
+    printable_serial = serial.decode('utf-8', 'replace')
+    for attempt in range(ADB_CONNECT_MAX_RETRIES):
+      logging.info('adb connection to %r dropped; reconnecting (%d/%d).',
+                   printable_serial, attempt + 1, ADB_CONNECT_MAX_RETRIES)
+      completed = subprocess.run(
+          connect_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+      output = (completed.stdout or b'').lower()
+      if completed.returncode == 0 and (
+          b'connected to' in output or b'already connected' in output):
+        return True
+      time.sleep(ADB_RECONNECT_BACKOFF_SEC)
+    # Give up confirming, but still report that a reconnect was attempted so the
+    # caller retries the command; the command itself will re-detect any failure.
+    return True
+
+  @staticmethod
+  def _LooksLikeTransportError(stderr_output: bytes) -> bool:
+    lowered = stderr_output.lower()
+    return any(marker in lowered for marker in ADB_TRANSPORT_ERROR_MARKERS)
+
+  def _RunAdb(self, args: List[bytes],
+              capture_stdout: bool) -> Tuple[int, Optional[bytes]]:
+    """Run 'adb <args>', reconnecting and retrying on transient drops.
+
+    Some remote/tcp devices close their adb connection every few commands and
+    only need a fresh 'adb connect host:port' to come back. We detect those
+    transport errors on stderr, reconnect, and retry so one dropped round trip
+    does not kill a whole sync.
+
+    stdout is captured only when capture_stdout is set; stderr is always
+    captured so it can be inspected, then forwarded to our stderr on the final
+    attempt.
+    """
+    attempt = 0
+    while True:
+      completed = subprocess.run(
+          self.adb + args,
+          stdout=subprocess.PIPE if capture_stdout else None,
+          stderr=subprocess.PIPE)
+      stderr_output = completed.stderr or b''
+      if (completed.returncode != 0 and attempt < ADB_RECONNECT_MAX_RETRIES and
+          self._LooksLikeTransportError(stderr_output) and self._Reconnect()):
+        attempt += 1
+        time.sleep(ADB_RECONNECT_BACKOFF_SEC)
+        continue
+      if stderr_output:
+        sys.stderr.buffer.write(stderr_output)
+        sys.stderr.buffer.flush()
+      return completed.returncode, (
+          completed.stdout if capture_stdout else None)
+
+  def _RunAdbShellLines(self, command: bytes,
+                        allow_failure: bool = False) -> List[bytes]:
+    """Run one device shell command and return its stdout split into lines."""
+    returncode, output = self._RunAdb([b'shell', command], capture_stdout=True)
+    if returncode != 0 and not allow_failure:
+      raise OSError('Subprocess exited with nonzero status.')
+    return (output or b'').splitlines()
+
+  def _RunAdbShellCall(self, command: bytes) -> int:
+    """Run one device shell command for effect and return its exit status."""
+    returncode, _ = self._RunAdb([b'shell', command], capture_stdout=False)
+    return returncode
 
   # Regarding parsing stat results, we only care for the following fields:
   # - st_size
@@ -218,51 +347,42 @@ class AdbFileSystem(GlobLike, OSLike):
         b'(', b'(;  #`ls`$PATH\'"(\\\\\\\\){};!\xc0\xaf\xff\xc2\xbf'
     ]
     for test_string in test_strings:
-      good = False
-      with Stdout(self.adb +
-                  [b'shell',
-                   b'date +%s' % (self.QuoteArgument(test_string),)]) as stdout:
-        for line in stdout:
-          line = line.rstrip(b'\r\n')
-          if line == test_string:
-            good = True
-      if not good:
+      command = b'date +%s' % (self.QuoteArgument(test_string),)
+      returncode, output = self._RunAdb(
+          [b'shell', command], capture_stdout=True)
+      if returncode != 0:
+        return False
+      if not any(line == test_string for line in (output or b'').splitlines()):
         return False
     return True
 
   def listdir(self, path: bytes) -> Iterable[bytes]:  # os's name, so pylint: disable=g-bad-name
     """List the contents of a directory, caching them for later lstat calls."""
-    with Stdout(self.adb +
-                [b'shell',
-                 b'ls -al %s' % (self.QuoteArgument(path + b'/'),)]) as stdout:
-      for line in stdout:
-        if line.startswith(b'total '):
-          continue
-        line = line.rstrip(b'\r\n')
-        try:
-          statdata, filename = self.LsToStat(line)
-        except OSError:
-          continue
-        if filename is None:
-          logging.error('Could not parse %r.', line)
-        else:
-          self.stat_cache[path + b'/' + filename] = statdata
-          yield filename
+    for line in self._RunAdbShellLines(
+        b'ls -al %s' % (self.QuoteArgument(path + b'/'),)):
+      if line.startswith(b'total '):
+        continue
+      try:
+        statdata, filename = self.LsToStat(line)
+      except OSError:
+        continue
+      if filename is None:
+        logging.error('Could not parse %r.', line)
+      else:
+        self.stat_cache[path + b'/' + filename] = statdata
+        yield filename
 
   def lstat(self, path: bytes) -> os.stat_result:  # os's name, so pylint: disable=g-bad-name
     """Stat a file."""
     if path in self.stat_cache:
       return self.stat_cache[path]
-    with Stdout(
-        self.adb +
-        [b'shell', b'ls -ald %s' % (self.QuoteArgument(path),)]) as stdout:
-      for line in stdout:
-        if line.startswith(b'total '):
-          continue
-        line = line.rstrip(b'\r\n')
-        statdata, _ = self.LsToStat(line)
-        self.stat_cache[path] = statdata
-        return statdata
+    for line in self._RunAdbShellLines(
+        b'ls -ald %s' % (self.QuoteArgument(path),), allow_failure=True):
+      if line.startswith(b'total '):
+        continue
+      statdata, _ = self.LsToStat(line)
+      self.stat_cache[path] = statdata
+      return statdata
     raise OSError('No such file or directory')
 
   def stat(self, path: bytes) -> os.stat_result:  # os's name, so pylint: disable=g-bad-name
@@ -270,29 +390,23 @@ class AdbFileSystem(GlobLike, OSLike):
     if path in self.stat_cache and not stat.S_ISLNK(
         self.stat_cache[path].st_mode):
       return self.stat_cache[path]
-    with Stdout(
-        self.adb +
-        [b'shell', b'ls -aldL %s' % (self.QuoteArgument(path),)]) as stdout:
-      for line in stdout:
-        if line.startswith(b'total '):
-          continue
-        line = line.rstrip(b'\r\n')
-        statdata, _ = self.LsToStat(line)
-        self.stat_cache[path] = statdata
-        return statdata
+    for line in self._RunAdbShellLines(
+        b'ls -aldL %s' % (self.QuoteArgument(path),), allow_failure=True):
+      if line.startswith(b'total '):
+        continue
+      statdata, _ = self.LsToStat(line)
+      self.stat_cache[path] = statdata
+      return statdata
     raise OSError('No such file or directory')
 
   def unlink(self, path: bytes) -> None:  # os's name, so pylint: disable=g-bad-name
     """Delete a file."""
-    if subprocess.call(
-        self.adb + [b'shell', b'rm %s' % (self.QuoteArgument(path),)]) != 0:
+    if self._RunAdbShellCall(b'rm %s' % (self.QuoteArgument(path),)) != 0:
       raise OSError('unlink failed')
 
   def rmdir(self, path: bytes) -> None:  # os's name, so pylint: disable=g-bad-name
     """Delete a directory."""
-    if subprocess.call(
-        self.adb +
-        [b'shell', b'rmdir %s' % (self.QuoteArgument(path),)]) != 0:
+    if self._RunAdbShellCall(b'rmdir %s' % (self.QuoteArgument(path),)) != 0:
       raise OSError('rmdir failed')
 
   def Checksums(self, paths: List[bytes]) -> Dict[bytes, bytes]:
@@ -321,15 +435,12 @@ class AdbFileSystem(GlobLike, OSLike):
           b' '.join(self.QuoteArgument(path) for path in batch) +
           b'; do checksum=$(md5sum < "$p") || exit $?; '
           b'echo "${checksum%% *}"; done')
-      try:
-        with Stdout(self.adb + [b'shell', command]) as stdout:
-          output = stdout.read()
-      except OSError as error:
+      returncode, output = self._RunAdb([b'shell', command], capture_stdout=True)
+      if returncode != 0:
         raise OSError(
             'Could not calculate checksums on the device. '
-            'Ensure that md5sum is installed and the files are readable.'
-        ) from error
-      lines = output.splitlines()
+            'Ensure that md5sum is installed and the files are readable.')
+      lines = (output or b'').splitlines()
       if len(lines) != len(batch):
         raise OSError(
             'Unexpected md5sum output from the device: expected %d lines, '
@@ -345,9 +456,7 @@ class AdbFileSystem(GlobLike, OSLike):
 
   def makedirs(self, path: bytes) -> None:  # os's name, so pylint: disable=g-bad-name
     """Create a directory."""
-    if subprocess.call(
-        self.adb +
-        [b'shell', b'mkdir -p %s' % (self.QuoteArgument(path),)]) != 0:
+    if self._RunAdbShellCall(b'mkdir -p %s' % (self.QuoteArgument(path),)) != 0:
       raise OSError('mkdir failed')
 
   def utime(self, path: bytes, times: Tuple[float, float]) -> None:
@@ -356,34 +465,124 @@ class AdbFileSystem(GlobLike, OSLike):
     atime, mtime = times
     timestr = time.strftime('%Y%m%d.%H%M%S',
                             time.localtime(mtime)).encode('ascii')
-    if subprocess.call(
-        self.adb +
-        [b'shell',
-         b'touch -mt %s %s' % (timestr, self.QuoteArgument(path))]) != 0:
+    if self._RunAdbShellCall(
+        b'touch -mt %s %s' % (timestr, self.QuoteArgument(path))) != 0:
       raise OSError('touch failed')
     timestr = time.strftime('%Y%m%d.%H%M%S',
                             time.localtime(atime)).encode('ascii')
-    if subprocess.call(
-        self.adb +
-        [b'shell',
-         b'touch -at %s %s' % (timestr, self.QuoteArgument(path))]) != 0:
+    if self._RunAdbShellCall(
+        b'touch -at %s %s' % (timestr, self.QuoteArgument(path))) != 0:
       raise OSError('touch failed')
 
   def glob(self, path: bytes) -> Iterable[bytes]:  # glob's name, so pylint: disable=g-bad-name
-    with Stdout(
-        self.adb +
-        [b'shell', b'for p in %s; do echo "$p"; done' % (path,)]) as stdout:
-      for line in stdout:
-        yield line.rstrip(b'\r\n')
+    for line in self._RunAdbShellLines(
+        b'for p in %s; do echo "$p"; done' % (path,)):
+      yield line
 
   def Push(self, src: bytes, dst: bytes) -> None:
     """Push a file from the local file system to the Android device."""
-    if subprocess.call(self.adb + [b'push', src, dst]) != 0:
+    returncode, _ = self._RunAdb([b'push', src, dst], capture_stdout=False)
+    if returncode == 0:
+      return
+    # Flaky tcp devices frequently transfer the whole file and only then drop
+    # the connection, so adb reports failure for a push that actually landed.
+    # Reconnecting and re-pushing a multi-second transfer hits the same drop
+    # every time, so accept the push when the on-device size already matches.
+    if self._PushLanded(src, dst):
+      logging.info(
+          'push of %r reported failure but the file landed intact; accepting.',
+          dst)
+      return
+    # A big file transfer takes longer than such a device stays connected, so
+    # every whole-file push straddles a drop. Retry it in small chunks that fit
+    # between drops, then reassemble and checksum-verify on the device.
+    if (self._TcpSerial() and
+        self._FileSize(src) > ADB_CHUNKED_PUSH_THRESHOLD):
+      logging.info('push of %r kept failing; retrying as a chunked transfer.',
+                   dst)
+      self._PushChunked(src, dst)
+      return
+    raise OSError('push failed')
+
+  def _FileSize(self, path: bytes) -> int:
+    try:
+      return os.lstat(path).st_size
+    except OSError:
+      return 0
+
+  def _PushLanded(self, src: bytes, dst: bytes) -> bool:
+    """Whether dst on the device already matches src's size after a failed push."""
+    try:
+      expected_size = os.lstat(src).st_size
+    except OSError:
+      return False
+    # adb push writes to dst directly, or into dst/<basename> when dst is a dir.
+    candidates = [dst, dst.rstrip(b'/') + b'/' + os.path.basename(src.rstrip(b'/'))]
+    for candidate in candidates:
+      self.stat_cache.pop(candidate, None)
+      try:
+        landed = self.lstat(candidate)
+      except OSError:
+        continue
+      if stat.S_ISREG(landed.st_mode) and landed.st_size == expected_size:
+        return True
+    return False
+
+  def _PushChunked(self, src: bytes, dst: bytes) -> None:
+    """Push src in small chunks, reassemble on the device, and verify md5."""
+    quoted_dst = self.QuoteArgument(dst)
+    # Quote the path but leave the trailing wildcard unquoted so the device
+    # shell expands it; this clears parts left behind by an earlier failed run.
+    stale_parts_glob = self.QuoteArgument(dst + ADB_CHUNK_SUFFIX) + b'.*'
+    self._RunAdbShellCall(b'rm -f %s %s' % (quoted_dst, stale_parts_glob))
+
+    parts = []  # type: List[bytes]
+    with tempfile.TemporaryDirectory() as scratch:
+      scratch_dir = os.fsencode(scratch)
+      with open(src, 'rb') as source:
+        index = 0
+        while True:
+          data = source.read(ADB_CHUNKED_PUSH_BYTES)
+          if not data:
+            break
+          local_part = os.path.join(scratch_dir, b'part.%05d' % index)
+          with open(local_part, 'wb') as chunk_file:
+            chunk_file.write(data)
+          remote_part = dst + ADB_CHUNK_SUFFIX + b'.%05d' % index
+          returncode, _ = self._RunAdb(
+              [b'push', local_part, remote_part], capture_stdout=False)
+          if returncode != 0 and not self._PushLanded(local_part, remote_part):
+            self._RunAdbShellCall(b'rm -f %s' % stale_parts_glob)
+            raise OSError('push failed')
+          parts.append(remote_part)
+          index += 1
+
+    if not parts:
+      if self._RunAdbShellCall(b': > %s' % quoted_dst) != 0:
+        raise OSError('push failed')
+      return
+
+    quoted_parts = b' '.join(self.QuoteArgument(part) for part in parts)
+    cat_status = self._RunAdbShellCall(b'cat %s > %s' % (quoted_parts, quoted_dst))
+    self._RunAdbShellCall(b'rm -f %s' % quoted_parts)
+    if cat_status != 0:
+      raise OSError('push failed')
+
+    # A truncated chunk or a bad reassembly must never look like success.
+    try:
+      expected = FileChecksum(src)
+      actual = self.Checksums([dst]).get(dst)
+    except OSError:
+      if self._PushLanded(src, dst):
+        return
+      raise OSError('push failed')
+    if actual != expected:
       raise OSError('push failed')
 
   def Pull(self, src: bytes, dst: bytes) -> None:
     """Pull a file from the Android device to the local file system."""
-    if subprocess.call(self.adb + [b'pull', src, dst]) != 0:
+    returncode, _ = self._RunAdb([b'pull', src, dst], capture_stdout=False)
+    if returncode != 0:
       raise OSError('pull failed')
 
 
