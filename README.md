@@ -91,6 +91,7 @@ removed from your PC, type one of:
 ```
 adb-sync --delete ~/Music /sdcard
 adb-sync --delete ~/Music/ /sdcard/Music
+adb-sync --mirror ~/Music/ /sdcard/Music
 ```
 
 To copy all downloads from your device to your PC, type:
@@ -98,6 +99,16 @@ To copy all downloads from your device to your PC, type:
 ```
 adb-sync --reverse /sdcard/Download/ ~/Downloads
 ```
+
+Release
+-------
+
+This fork publishes `adb-sync` independently. The current release version is
+reported by `adb-sync --version`; yuutils packages this executable as one of
+its script tools but owns a separate version.
+
+`--mirror` is an explicit alias for `--delete`: it removes remote files and
+directories below the destination that are absent from the local source.
 
 Accurate File Comparison
 ========================
