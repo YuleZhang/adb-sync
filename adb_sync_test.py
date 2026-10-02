@@ -19,8 +19,10 @@ import importlib.machinery
 import importlib.util
 import hashlib
 import os
+import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -359,7 +361,7 @@ class ChunkedPushTest(unittest.TestCase):
     pushed_order = []
 
     def fake_run_adb(args, capture_stdout):
-      # args == [b'push', local_part, remote_part]
+      # args == [b'push', <push_args...>, local_part, remote_part]
       local_part, remote_part = args[-2], args[-1]
       with open(local_part, 'rb') as handle:
         store[remote_part] = handle.read()
@@ -402,6 +404,414 @@ class ChunkedPushTest(unittest.TestCase):
       src = self._MakeSrc(directory, size)
       with self.assertRaises(OSError):
         self._RunChunked(adb, src, b'/data/local/tmp/big', corrupt=True)
+
+
+class FakeDeviceFileSystem:
+  """Just enough of AdbFileSystem for ResolvePushDest."""
+
+  def __init__(self, directories=(), files=()):
+    self.directories = set(directories)
+    self.files = set(files)
+
+  def stat(self, path):
+    if path in self.directories:
+      return Stat(0, mode=stat.S_IFDIR | 0o755)
+    if path in self.files:
+      return Stat(4)
+    raise OSError('No such file or directory')
+
+
+class ParseAdbPushArgvTest(unittest.TestCase):
+
+  def test_plain_push(self):
+    call = adb_sync.ParseAdbPushArgv([b'push', b'lib.so', b'/data/local/tmp'])
+    self.assertEqual([], call.global_options)
+    self.assertEqual([b'lib.so'], call.sources)
+    self.assertEqual(b'/data/local/tmp', call.destination)
+    self.assertFalse(call.dry_run)
+    self.assertFalse(call.quiet)
+
+  def test_global_options_are_kept_for_every_adb_invocation(self):
+    call = adb_sync.ParseAdbPushArgv(
+        [b'-s', b'10.0.0.1:5555', b'-d', b'push', b'a', b'/b'])
+    self.assertEqual([b'-s', b'10.0.0.1:5555', b'-d'], call.global_options)
+
+  def test_options_are_accepted_after_the_destination(self):
+    # Existing scripts write 'adb push ${input_dir}/* /data/... --sync'.
+    call = adb_sync.ParseAdbPushArgv(
+        [b'push', b'a', b'b', b'/dest', b'--sync'])
+    self.assertEqual([b'a', b'b'], call.sources)
+    self.assertEqual(b'/dest', call.destination)
+    # --sync compares timestamps; comparing contents supersedes it, so it is
+    # dropped rather than passed on.
+    self.assertEqual([], call.push_options)
+
+  def test_compression_options_are_passed_through(self):
+    call = adb_sync.ParseAdbPushArgv(
+        [b'push', b'-Z', b'-z', b'lz4', b'a', b'/b'])
+    self.assertEqual([b'-Z', b'-z', b'lz4'], call.push_options)
+
+  def test_dry_run_and_quiet_are_recognised(self):
+    call = adb_sync.ParseAdbPushArgv([b'push', b'-n', b'-q', b'a', b'/b'])
+    self.assertTrue(call.dry_run)
+    self.assertTrue(call.quiet)
+
+  def test_mirror_is_consumed_by_adb_sync(self):
+    call = adb_sync.ParseAdbPushArgv(
+        [b'push', b'a', b'/data/local/tmp/input', b'--mirror'])
+    self.assertTrue(call.mirror)
+    self.assertEqual([], call.push_options)
+    self.assertEqual([b'a'], call.sources)
+    self.assertEqual(b'/data/local/tmp/input', call.destination)
+
+  def test_rejects_what_adb_rejects(self):
+    for argv in [
+        [b'push'],
+        [b'push', b'only-one-argument'],
+        [b'push', b'--bogus', b'a', b'/b'],
+        [b'push', b'-z'],
+        [b'-s'],
+        [b'shell', b'ls'],
+        [],
+    ]:
+      with self.assertRaises(adb_sync.UsageError):
+        adb_sync.ParseAdbPushArgv(argv)
+
+
+class PushDestinationTest(unittest.TestCase):
+  """The cases measured against adb 1.0.41 on taro and motorola_edge_2025."""
+
+  def setUp(self):
+    self.directory = tempfile.TemporaryDirectory()
+    self.addCleanup(self.directory.cleanup)
+    root = os.fsencode(self.directory.name)
+    self.file = root + b'/f1'
+    with open(self.file, 'wb') as output:
+      output.write(b'f1')
+    self.dir = root + b'/dirA'
+    os.mkdir(self.dir)
+    with open(self.dir + b'/a1', 'wb') as output:
+      output.write(b'a1')
+
+  def test_basename_ignores_trailing_slashes(self):
+    self.assertEqual(b'c', adb_sync.PushBasename(b'a/b/c'))
+    self.assertEqual(b'c', adb_sync.PushBasename(b'a/b/c/'))
+    self.assertEqual(b'c', adb_sync.PushBasename(b'a/b/c///'))
+    self.assertEqual(b'c', adb_sync.PushBasename(b'c'))
+
+  def test_file_into_existing_directory(self):
+    fs = FakeDeviceFileSystem(directories=[b'/dest'])
+    self.assertEqual(
+        [(self.file, b'/dest/f1')],
+        adb_sync.ResolvePushDest(fs, [self.file], b'/dest/'))
+
+  def test_file_to_absent_path_is_a_rename(self):
+    fs = FakeDeviceFileSystem(directories=[b'/dest'])
+    self.assertEqual(
+        [(self.file, b'/dest/newname')],
+        adb_sync.ResolvePushDest(fs, [self.file], b'/dest/newname'))
+
+  def test_file_onto_existing_file_overwrites_it(self):
+    fs = FakeDeviceFileSystem(directories=[b'/dest'], files=[b'/dest/victim'])
+    self.assertEqual(
+        [(self.file, b'/dest/victim')],
+        adb_sync.ResolvePushDest(fs, [self.file], b'/dest/victim'))
+
+  def test_directory_into_existing_directory(self):
+    fs = FakeDeviceFileSystem(directories=[b'/dest'])
+    self.assertEqual(
+        [(self.dir, b'/dest/dirA')],
+        adb_sync.ResolvePushDest(fs, [self.dir], b'/dest'))
+
+  def test_trailing_slash_on_source_is_ignored(self):
+    fs = FakeDeviceFileSystem(directories=[b'/dest'])
+    self.assertEqual(
+        [(self.dir + b'/', b'/dest/dirA')],
+        adb_sync.ResolvePushDest(fs, [self.dir + b'/'], b'/dest'))
+
+  def test_directory_to_absent_path_is_a_rename(self):
+    fs = FakeDeviceFileSystem(directories=[b'/dest'])
+    self.assertEqual(
+        [(self.dir, b'/dest/newname')],
+        adb_sync.ResolvePushDest(fs, [self.dir], b'/dest/newname'))
+
+  def test_multiple_sources_land_under_the_destination(self):
+    fs = FakeDeviceFileSystem(directories=[b'/dest'])
+    self.assertEqual(
+        [(self.file, b'/dest/f1'), (self.dir, b'/dest/dirA')],
+        adb_sync.ResolvePushDest(fs, [self.file, self.dir], b'/dest'))
+
+  def test_multiple_sources_need_an_existing_directory(self):
+    fs = FakeDeviceFileSystem(directories=[b'/dest'])
+    with self.assertRaises(adb_sync.UsageError):
+      adb_sync.ResolvePushDest(fs, [self.file, self.dir], b'/dest/absent')
+
+  def test_directory_onto_existing_file_is_refused(self):
+    # FileSyncer would happily unlink the remote file and put a directory there;
+    # the real adb push fails, so this has to be caught before that.
+    fs = FakeDeviceFileSystem(directories=[b'/dest'], files=[b'/dest/victim'])
+    with self.assertRaises(adb_sync.UsageError):
+      adb_sync.ResolvePushDest(fs, [self.dir], b'/dest/victim')
+
+  def test_absent_destination_ending_in_slash_is_refused(self):
+    fs = FakeDeviceFileSystem(directories=[b'/dest'])
+    with self.assertRaises(adb_sync.UsageError):
+      adb_sync.ResolvePushDest(fs, [self.file], b'/dest/absent/')
+
+  def test_missing_source_is_refused(self):
+    fs = FakeDeviceFileSystem(directories=[b'/dest'])
+    with self.assertRaises(adb_sync.UsageError):
+      adb_sync.ResolvePushDest(fs, [self.file + b'.nope'], b'/dest')
+
+
+class CountDifferingFilesTest(unittest.TestCase):
+
+  def MakeScanned(self, local_only, both, checksum_different=()):
+    syncer = object.__new__(adb_sync.FileSyncer)
+    syncer.local_only = list(local_only)
+    syncer.both = list(both)
+    syncer.checksum_different = set(checksum_different)
+    return syncer
+
+  def test_new_files_count_as_differing(self):
+    syncer = self.MakeScanned([(b'/new', Stat(4))], [])
+    self.assertEqual((1, 1), adb_sync.CountDifferingFiles(syncer))
+
+  def test_same_size_files_count_as_identical(self):
+    syncer = self.MakeScanned([], [(b'/same', Stat(4), Stat(4))])
+    self.assertEqual((0, 1), adb_sync.CountDifferingFiles(syncer))
+
+  def test_same_size_but_different_contents_counts_as_differing(self):
+    syncer = self.MakeScanned([], [(b'/same', Stat(4), Stat(4))], [b'/same'])
+    self.assertEqual((1, 1), adb_sync.CountDifferingFiles(syncer))
+
+  def test_directories_are_not_counted(self):
+    directory = Stat(0, mode=stat.S_IFDIR | 0o755)
+    syncer = self.MakeScanned([(b'/d', directory)],
+                              [(b'/e', directory, directory)])
+    self.assertEqual((0, 0), adb_sync.CountDifferingFiles(syncer))
+
+
+class FakeAdb:
+  """Enough of AdbFileSystem for PlanFilePushes."""
+
+  def __init__(self, entries=None, checksums=None, no_checksums=False):
+    # entries: {directory: {name: stat_result}}
+    self.entries = entries or {}
+    self.checksums = checksums or {}
+    self.no_checksums = no_checksums
+    self.stat_cache = {}
+    self.listed = []
+    self.checksum_calls = []
+
+  def listdir(self, directory):
+    self.listed.append(directory)
+    if directory not in self.entries:
+      raise OSError('No such file or directory')
+    for name, statdata in self.entries[directory].items():
+      self.stat_cache[directory + b'/' + name] = statdata
+      yield name
+
+  def stat(self, path):
+    if path in self.stat_cache:
+      return self.stat_cache[path]
+    raise OSError('No such file or directory')
+
+  def Checksums(self, paths):
+    self.checksum_calls.append(list(paths))
+    if self.no_checksums:
+      raise adb_sync.ChecksumUnavailable('no md5sum on the device')
+    return {path: self.checksums[path] for path in paths}
+
+
+class PlanFilePushesTest(unittest.TestCase):
+  """Many small files in one call is the shape that has to stay cheap."""
+
+  def setUp(self):
+    self.directory = tempfile.TemporaryDirectory()
+    self.addCleanup(self.directory.cleanup)
+    self.root = os.fsencode(self.directory.name)
+
+  def WriteLocal(self, name, contents):
+    path = self.root + b'/' + name
+    with open(path, 'wb') as output:
+      output.write(contents)
+    return path
+
+  def test_lists_each_destination_directory_once(self):
+    locals_ = [self.WriteLocal(b'f%d' % index, b'x') for index in range(20)]
+    pairs = [(path, b'/dest/' + os.path.basename(path)) for path in locals_]
+    adb = FakeAdb(entries={b'/dest': {}})
+    needed, identical, existing = adb_sync.PlanFilePushes(adb, pairs)
+    self.assertEqual([b'/dest'], adb.listed)
+    self.assertEqual(pairs, needed)
+    self.assertEqual(0, identical)
+    self.assertEqual({b'/dest'}, existing)
+
+  def test_checksums_every_candidate_in_one_call(self):
+    same = [self.WriteLocal(b'same%d' % index, b'abcd') for index in range(5)]
+    pairs = [(path, b'/dest/' + os.path.basename(path)) for path in same]
+    adb = FakeAdb(
+        entries={b'/dest': {os.path.basename(path): Stat(4) for path in same}},
+        checksums={remote: adb_sync.FileChecksum(local)
+                   for local, remote in pairs})
+    needed, identical, _ = adb_sync.PlanFilePushes(adb, pairs)
+    self.assertEqual(1, len(adb.checksum_calls))
+    self.assertEqual(5, len(adb.checksum_calls[0]))
+    self.assertEqual([], needed)
+    self.assertEqual(5, identical)
+
+  def test_different_size_needs_no_checksum(self):
+    local = self.WriteLocal(b'f', b'abcd')
+    pairs = [(local, b'/dest/f')]
+    adb = FakeAdb(entries={b'/dest': {b'f': Stat(99)}})
+    needed, identical, _ = adb_sync.PlanFilePushes(adb, pairs)
+    self.assertEqual(pairs, needed)
+    self.assertEqual(0, identical)
+    self.assertEqual([], adb.checksum_calls)
+
+  def test_same_size_different_contents_is_transferred(self):
+    local = self.WriteLocal(b'f', b'abcd')
+    pairs = [(local, b'/dest/f')]
+    adb = FakeAdb(entries={b'/dest': {b'f': Stat(4)}},
+                  checksums={b'/dest/f': b'0' * 32})
+    needed, identical, _ = adb_sync.PlanFilePushes(adb, pairs)
+    self.assertEqual(pairs, needed)
+    self.assertEqual(0, identical)
+
+  def test_absent_destination_directory_transfers_everything(self):
+    local = self.WriteLocal(b'f', b'abcd')
+    pairs = [(local, b'/nope/f')]
+    needed, identical, existing = adb_sync.PlanFilePushes(FakeAdb(), pairs)
+    self.assertEqual(pairs, needed)
+    self.assertEqual(0, identical)
+    self.assertEqual(set(), existing)
+
+  def test_remote_directory_in_the_way_is_left_to_adb(self):
+    # Overwriting a directory with a file is adb's error to report, not ours.
+    local = self.WriteLocal(b'f', b'abcd')
+    pairs = [(local, b'/dest/f')]
+    adb = FakeAdb(
+        entries={b'/dest': {b'f': Stat(0, mode=stat.S_IFDIR | 0o755)}})
+    needed, _, _ = adb_sync.PlanFilePushes(adb, pairs)
+    self.assertEqual(pairs, needed)
+
+  def test_size_only_comparison_when_asked(self):
+    local = self.WriteLocal(b'f', b'abcd')
+    pairs = [(local, b'/dest/f')]
+    adb = FakeAdb(entries={b'/dest': {b'f': Stat(4)}}, no_checksums=True)
+    needed, identical, _ = adb_sync.PlanFilePushes(adb, pairs,
+                                                  use_checksums=False)
+    self.assertEqual([], needed)
+    self.assertEqual(1, identical)
+    self.assertEqual([], adb.checksum_calls)
+
+
+class RunBatchedPushesTest(unittest.TestCase):
+
+  def Run(self, pairs, existing, status=0):
+    with mock.patch.object(adb_sync.subprocess, 'call',
+                           return_value=status) as call:
+      result = adb_sync.RunBatchedPushes([b'adb'], [], pairs, existing)
+    return result, [arguments[0][0] for arguments in call.call_args_list]
+
+  def test_files_keeping_their_name_share_one_push(self):
+    pairs = [(b'/l/a', b'/dest/a'), (b'/l/b', b'/dest/b'),
+             (b'/l/c', b'/dest/c')]
+    result, commands = self.Run(pairs, {b'/dest'})
+    self.assertEqual(0, result)
+    self.assertEqual([[b'adb', b'push', b'/l/a', b'/l/b', b'/l/c', b'/dest/']],
+                     commands)
+
+  def test_separate_destinations_get_separate_pushes(self):
+    pairs = [(b'/l/a', b'/one/a'), (b'/l/b', b'/two/b')]
+    _, commands = self.Run(pairs, {b'/one', b'/two'})
+    self.assertEqual([[b'adb', b'push', b'/l/a', b'/one/'],
+                      [b'adb', b'push', b'/l/b', b'/two/']], commands)
+
+  def test_renames_are_pushed_individually(self):
+    # 'adb push model_policy /dest/model_policy_v2' cannot be grouped: the
+    # grouped form would land it as /dest/model_policy.
+    pairs = [(b'/l/model_policy', b'/dest/model_policy_v2')]
+    _, commands = self.Run(pairs, {b'/dest'})
+    self.assertEqual(
+        [[b'adb', b'push', b'/l/model_policy', b'/dest/model_policy_v2']],
+        commands)
+
+  def test_absent_destination_directory_is_pushed_individually(self):
+    # A grouped push into a directory that does not exist fails, while adb
+    # creates the parents when given the full path.
+    pairs = [(b'/l/a', b'/dest/deep/a')]
+    _, commands = self.Run(pairs, set())
+    self.assertEqual([[b'adb', b'push', b'/l/a', b'/dest/deep/a']], commands)
+
+  def test_long_lists_are_split(self):
+    count = adb_sync.MAX_PUSH_SOURCES + 5
+    pairs = [(b'/l/f%d' % index, b'/dest/f%d' % index) for index in range(count)]
+    _, commands = self.Run(pairs, {b'/dest'})
+    self.assertEqual(2, len(commands))
+    self.assertEqual(adb_sync.MAX_PUSH_SOURCES + 3, len(commands[0]))
+    self.assertEqual(8, len(commands[1]))
+
+  def test_failure_stops_and_is_reported(self):
+    pairs = [(b'/l/a', b'/one/a'), (b'/l/b', b'/two/b')]
+    result, commands = self.Run(pairs, {b'/one', b'/two'}, status=1)
+    self.assertEqual(1, result)
+    self.assertEqual(1, len(commands))
+
+
+class MirrorDeletionTest(unittest.TestCase):
+
+  def test_deletes_extra_files_before_directories_and_keeps_requested_names(self):
+    entries = [
+        (b'', Stat(0, mode=stat.S_IFDIR | 0o755)),
+        (b'/keep.raw', Stat(4)),
+        (b'/stale.raw', Stat(4)),
+        (b'/old_dir', Stat(0, mode=stat.S_IFDIR | 0o755)),
+        (b'/old_dir/nested.raw', Stat(4)),
+    ]
+    adb = mock.Mock()
+    with mock.patch.object(adb_sync, 'BuildFileList', return_value=entries):
+      count = adb_sync.DeleteMirrorExtras(
+          adb, b'/data/local/tmp/input', {b'keep.raw'}, False)
+    self.assertEqual(3, count)
+    self.assertEqual(
+        [mock.call.unlink(b'/data/local/tmp/input/old_dir/nested.raw'),
+         mock.call.unlink(b'/data/local/tmp/input/stale.raw'),
+         mock.call.rmdir(b'/data/local/tmp/input/old_dir')],
+        adb.method_calls)
+
+  def test_dry_run_lists_deletions_without_touching_device(self):
+    entries = [
+        (b'', Stat(0, mode=stat.S_IFDIR | 0o755)),
+        (b'/stale.raw', Stat(4)),
+    ]
+    adb = mock.Mock()
+    with mock.patch.object(adb_sync, 'BuildFileList', return_value=entries):
+      count = adb_sync.DeleteMirrorExtras(
+          adb, b'/data/local/tmp/input', set(), True)
+    self.assertEqual(1, count)
+    adb.unlink.assert_not_called()
+    adb.rmdir.assert_not_called()
+
+
+class AdbCompatPushMainTest(unittest.TestCase):
+  """Exit status is the point here: callers run under 'set -e'."""
+
+  def test_unparseable_arguments_fail(self):
+    self.assertEqual(
+        1, adb_sync.AdbCompatPushMain(['--real-adb', '/bin/true', '--',
+                                       'push', '--bogus', 'a', '/b']))
+
+  def test_missing_real_adb_argument_fails(self):
+    self.assertEqual(1, adb_sync.AdbCompatPushMain(['--real-adb']))
+
+  def test_missing_source_fails(self):
+    self.assertEqual(
+        1, adb_sync.AdbCompatPushMain(['--real-adb', '/bin/true', '--', 'push',
+                                       '/definitely/not/here', '/data']))
+
+
 
 
 if __name__ == '__main__':
