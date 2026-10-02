@@ -798,6 +798,41 @@ class MirrorDeletionTest(unittest.TestCase):
 class AdbCompatPushMainTest(unittest.TestCase):
   """Exit status is the point here: callers run under 'set -e'."""
 
+  def test_environment_flag_matches_shell_false_values(self):
+    for value in ('', '0', 'no', 'false', 'off', '  OFF  '):
+      with self.subTest(value=value), mock.patch.dict(
+          adb_sync.os.environ, {'ADB_SYNC_NO_RM': value}, clear=False):
+        self.assertFalse(adb_sync.EnvironmentFlag('ADB_SYNC_NO_RM'))
+    for value in ('1', 'yes', 'true', 'on', 'verbose'):
+      with self.subTest(value=value), mock.patch.dict(
+          adb_sync.os.environ, {'ADB_SYNC_NO_RM': value}, clear=False):
+        self.assertTrue(adb_sync.EnvironmentFlag('ADB_SYNC_NO_RM'))
+    with mock.patch.dict(adb_sync.os.environ, {}, clear=True):
+      self.assertFalse(adb_sync.EnvironmentFlag('ADB_SYNC_NO_RM'))
+
+  def test_zero_no_rm_allows_file_directory_replacement(self):
+    with tempfile.TemporaryDirectory() as directory:
+      source = os.fsencode(directory)
+      destination = b'/data/local/tmp/destination'
+      syncer = mock.Mock()
+      syncer.local_only = []
+      syncer.both = []
+      syncer.remote_only = []
+      syncer.checksum_different = set()
+      syncer.num_bytes = 0
+      with mock.patch.dict(adb_sync.os.environ, {'ADB_SYNC_NO_RM': '0'},
+                           clear=False), mock.patch.object(
+                               adb_sync, 'ResolvePushDest',
+                               return_value=[(source, destination)]), \
+          mock.patch.object(adb_sync, 'FileSyncer',
+                            return_value=syncer) as syncer_factory:
+        self.assertEqual(
+            0, adb_sync.AdbCompatPushMain([
+                '--real-adb', '/bin/true', '--', 'push',
+                directory, os.fsdecode(destination),
+            ]))
+      self.assertTrue(syncer_factory.call_args.kwargs['allow_replace'])
+
   def test_unparseable_arguments_fail(self):
     self.assertEqual(
         1, adb_sync.AdbCompatPushMain(['--real-adb', '/bin/true', '--',

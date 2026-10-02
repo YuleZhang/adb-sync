@@ -132,6 +132,17 @@ ADB_CONNECT_MAX_RETRIES = 4
 ADB_CHUNKED_PUSH_THRESHOLD = 8 * 1024 * 1024
 ADB_CHUNKED_PUSH_BYTES = 2 * 1024 * 1024
 ADB_CHUNK_SUFFIX = b'.adbsync-part'
+FALSE_ENV_VALUES = frozenset(('', '0', 'no', 'false', 'off'))
+
+
+def EnvironmentFlag(name: str) -> bool:
+  """Returns whether a string environment flag is enabled.
+
+  The shell shim uses the same convention: an unset, empty, zero, or common
+  false-like value disables the flag; any other non-empty value enables it.
+  """
+  value = os.environ.get(name, '')
+  return value.strip().lower() not in FALSE_ENV_VALUES
 
 
 class AdbFileSystem(GlobLike, OSLike):
@@ -1433,9 +1444,9 @@ def AdbCompatPushMain(argv: List[str]) -> int:
   if argv and argv[0] == '--':
     argv = argv[1:]
 
-  quiet_environment = bool(os.environ.get('ADB_SYNC_QUIET'))
-  verbose = bool(os.environ.get('ADB_SYNC_VERBOSE'))
-  no_remote_delete = bool(os.environ.get('ADB_SYNC_NO_RM'))
+  quiet_environment = EnvironmentFlag('ADB_SYNC_QUIET')
+  verbose = EnvironmentFlag('ADB_SYNC_VERBOSE')
+  no_remote_delete = EnvironmentFlag('ADB_SYNC_NO_RM')
 
   bulk_percent = BULK_PUSH_PERCENT
   configured_percent = os.environ.get('ADB_SYNC_BULK_PERCENT')
