@@ -289,9 +289,8 @@ class AdbFileSystem(GlobLike, OSLike):
                                (?P<st_size> [0-9]+)           # Size.
                                [ ]+)
                              (?P<st_mtime>
-                               [0-9]{4}-[0-9]{2}-[0-9]{2}     # Date.
-                               [ ]
-                               [0-9]{2}:[0-9]{2})             # Time.
+                               (?:[0-9]{4}-[0-9]{2}-[0-9]{2}[ ][0-9]{2}:[0-9]{2} |
+                                  [A-Za-z]{3}[ ]+[0-9]{1,2}[ ]+(?:[0-9]{2}:[0-9]{2}|[0-9]{4})))
                              [ ]
                              # Don't capture filename for symlinks (ambiguous).
                              (?(S_IFLNK) .* | (?P<filename> .*))
@@ -336,10 +335,16 @@ class AdbFileSystem(GlobLike, OSLike):
     if groups['S_IFSOCK']:
       st_mode |= stat.S_IFSOCK
     st_size = None if groups['st_size'] is None else int(groups['st_size'])
-    st_mtime = int(
-        time.mktime(
-            time.strptime(
-                match.group('st_mtime').decode('ascii'), '%Y-%m-%d %H:%M')))
+    timestamp = match.group('st_mtime').decode('ascii')
+    if timestamp[0].isdigit():
+      st_mtime = int(time.mktime(time.strptime(timestamp, '%Y-%m-%d %H:%M')))
+    elif ':' in timestamp:
+      year = time.localtime().tm_year
+      st_mtime = int(time.mktime(time.strptime(f'{timestamp} {year}', '%b %d %H:%M %Y')))
+      if st_mtime > time.time() + 86400:
+        st_mtime = int(time.mktime(time.strptime(f'{timestamp} {year - 1}', '%b %d %H:%M %Y')))
+    else:
+      st_mtime = int(time.mktime(time.strptime(timestamp, '%b %d %Y')))
 
     # Fill the rest with dummy values.
     st_ino = 1
