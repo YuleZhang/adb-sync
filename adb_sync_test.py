@@ -39,6 +39,15 @@ def LoadAdbSync():
 adb_sync = LoadAdbSync()
 
 
+class LsParsingTest(unittest.TestCase):
+  def test_busybox_dates(self):
+    fs = adb_sync.AdbFileSystem.__new__(adb_sync.AdbFileSystem)
+    for date in (b'Jan 13 23:59', b'Jan  3 2024'):
+      info, name = fs.LsToStat(b'drwxrwxrwx 7 root root 4096 ' + date + b' /data/test')
+      self.assertTrue(stat.S_ISDIR(info.st_mode))
+      self.assertEqual(name, b'/data/test')
+
+
 def Stat(size, mtime=0, mode=stat.S_IFREG | 0o644):
   return os.stat_result((mode, 1, 0, 1, 0, 0, size, mtime, mtime, mtime))
 
